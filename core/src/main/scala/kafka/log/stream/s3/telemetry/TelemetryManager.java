@@ -18,6 +18,8 @@ import com.automq.stream.s3.metrics.MetricsConfig;
 import com.automq.stream.s3.metrics.MetricsLevel;
 import com.automq.stream.s3.metrics.S3StreamMetricsManager;
 import com.automq.stream.s3.operator.BucketURI;
+import com.automq.stream.s3.operator.ObjectStorage;
+import com.automq.stream.s3.operator.ObjectStorageFactory;
 import com.automq.stream.s3.wal.metrics.ObjectWALMetricsManager;
 import io.opentelemetry.api.OpenTelemetry;
 import io.opentelemetry.api.baggage.propagation.W3CBaggagePropagator;
@@ -174,7 +176,8 @@ public class TelemetryManager {
         S3StreamKafkaMetricsManager.configure(new MetricsConfig(metricsLevel(), Attributes.empty(), kafkaConfig.s3ExporterReportIntervalMs()));
         S3StreamKafkaMetricsManager.initMetrics(meter, TelemetryConstants.KAFKA_METRICS_PREFIX);
 
-        if (kafkaConfig.s3WALPath().startsWith("0@s3://")) {
+        // kraft controller may not have s3WALPath config.
+        if (StringUtils.isNotEmpty(kafkaConfig.s3WALPath()) && kafkaConfig.s3WALPath().startsWith("0@s3://")) {
             ObjectWALMetricsManager.initMetrics(meter, TelemetryConstants.KAFKA_WAL_METRICS_PREFIX);
         }
     }
@@ -297,6 +300,7 @@ public class TelemetryManager {
         }
         BucketURI bucket = kafkaConfig.automq().opsBuckets().get(0);
 
+        ObjectStorage objectStorage = ObjectStorageFactory.instance().builder(kafkaConfig.automq().opsBuckets().get(0)).build();
         S3MetricsExporter s3MetricsExporter = new S3MetricsExporter(new S3MetricsConfig() {
             @Override
             public String clusterId() {
@@ -315,8 +319,8 @@ public class TelemetryManager {
             }
 
             @Override
-            public BucketURI bucket() {
-                return bucket;
+            public ObjectStorage objectStorage() {
+                return objectStorage;
             }
         });
         s3MetricsExporter.start();

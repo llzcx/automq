@@ -27,7 +27,16 @@ public interface ObjectStorage {
     Writer writer(WriteOptions options, String objectPath);
 
     /**
-     * Range read object from the object.
+     * Read object from the object storage.
+     * It will throw {@link ObjectNotFoundException} if the object not found.
+     */
+    default CompletableFuture<ByteBuf> read(ReadOptions options, String objectPath) {
+        return rangeRead(options, objectPath, 0, -1);
+    }
+
+    /**
+     * Range read object from the object storage.
+     * It will throw {@link ObjectNotFoundException} if the object not found.
      */
     CompletableFuture<ByteBuf> rangeRead(ReadOptions options, String objectPath, long start, long end);
 
@@ -89,6 +98,8 @@ public interface ObjectStorage {
         private int allocType = ByteBufAlloc.DEFAULT;
         private long apiCallAttemptTimeout = -1L;
         private short bucketId;
+        private boolean enableFastRetry;
+        private boolean retry;
 
         public WriteOptions throttleStrategy(ThrottleStrategy throttleStrategy) {
             this.throttleStrategy = throttleStrategy;
@@ -102,6 +113,16 @@ public interface ObjectStorage {
 
         public WriteOptions apiCallAttemptTimeout(long apiCallAttemptTimeout) {
             this.apiCallAttemptTimeout = apiCallAttemptTimeout;
+            return this;
+        }
+
+        public WriteOptions enableFastRetry(boolean enableFastRetry) {
+            this.enableFastRetry = enableFastRetry;
+            return this;
+        }
+
+        public WriteOptions retry(boolean retry) {
+            this.retry = retry;
             return this;
         }
 
@@ -127,12 +148,22 @@ public interface ObjectStorage {
             return bucketId;
         }
 
+        public boolean enableFastRetry() {
+            return enableFastRetry;
+        }
+
+        public boolean retry() {
+            return retry;
+        }
+
         public WriteOptions copy() {
             WriteOptions copy = new WriteOptions();
             copy.throttleStrategy = throttleStrategy;
             copy.allocType = allocType;
             copy.apiCallAttemptTimeout = apiCallAttemptTimeout;
             copy.bucketId = bucketId;
+            copy.enableFastRetry = enableFastRetry;
+            copy.retry = retry;
             return copy;
         }
     }
@@ -171,6 +202,12 @@ public interface ObjectStorage {
 
         public short bucket() {
             return bucket;
+        }
+    }
+
+    class ObjectNotFoundException extends Exception {
+        public ObjectNotFoundException(Throwable cause) {
+            super(cause);
         }
     }
 }
