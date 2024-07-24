@@ -1,5 +1,5 @@
 /*
- * Copyright 2024, AutoMQ CO.,LTD.
+ * Copyright 2024, AutoMQ HK Limited.
  *
  * Use of this software is governed by the Business Source License
  * included in the file BSL.md
@@ -18,6 +18,7 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 
 public interface ObjectStorage {
+    long RANGE_READ_TO_END = -1L;
 
     void close();
 
@@ -31,7 +32,7 @@ public interface ObjectStorage {
      * It will throw {@link ObjectNotFoundException} if the object not found.
      */
     default CompletableFuture<ByteBuf> read(ReadOptions options, String objectPath) {
-        return rangeRead(options, objectPath, 0, -1);
+        return rangeRead(options, objectPath, 0, RANGE_READ_TO_END);
     }
 
     /**
@@ -44,6 +45,9 @@ public interface ObjectStorage {
     CompletableFuture<WriteResult> write(WriteOptions options, String objectPath, ByteBuf buf);
 
     CompletableFuture<List<ObjectInfo>> list(String prefix);
+
+    // NOTE: this is a temporary method to get bucketId for direct read with object storage interface
+    short bucketId();
 
     /**
      * The deleteObjects API have max batch limit.

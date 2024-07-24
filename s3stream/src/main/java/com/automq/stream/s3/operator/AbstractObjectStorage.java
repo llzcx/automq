@@ -1,5 +1,5 @@
 /*
- * Copyright 2024, AutoMQ CO.,LTD.
+ * Copyright 2024, AutoMQ HK Limited.
  *
  * Use of this software is governed by the Business Source License
  * included in the file BSL.md
@@ -45,7 +45,7 @@ import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.stream.Collectors;
+import java.util.function.BiFunction;
 import org.apache.commons.lang3.tuple.Pair;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -63,7 +63,7 @@ public abstract class AbstractObjectStorage implements ObjectStorage {
     private final Semaphore inflightReadLimiter;
     private final Semaphore inflightWriteLimiter;
     private final List<AbstractObjectStorage.ReadTask> waitingReadTasks = new LinkedList<>();
-    private final NetworkBandwidthLimiter networkInboundBandwidthLimiter;
+    protected final NetworkBandwidthLimiter networkInboundBandwidthLimiter;
     protected final NetworkBandwidthLimiter networkOutboundBandwidthLimiter;
     protected final ExecutorService writeLimiterCallbackExecutor = Threads.newFixedThreadPoolWithMonitor(1,
         "s3-write-limiter-cb-executor", true, LOGGER);
@@ -77,6 +77,8 @@ public abstract class AbstractObjectStorage implements ObjectStorage {
         ThreadUtils.createThreadFactory("objectStorage", true), LOGGER);
     private final HashedWheelTimer fastRetryTimer = new HashedWheelTimer(
         ThreadUtils.createThreadFactory("s3-fast-retry-timer", true), 10, TimeUnit.MILLISECONDS, 1000);
+
+    private final DeleteObjectsAccumulator deleteObjectsAccumulator;
     final boolean checkS3ApiMode;
     protected final BucketURI bucketURI;
     private final S3LatencyCalculator s3LatencyCalculator;
@@ -104,6 +106,9 @@ public abstract class AbstractObjectStorage implements ObjectStorage {
         checkConfig();
         S3StreamMetricsManager.registerInflightS3ReadQuotaSupplier(inflightReadLimiter::availablePermits, currentIndex);
         S3StreamMetricsManager.registerInflightS3WriteQuotaSupplier(inflightWriteLimiter::availablePermits, currentIndex);
+
+        this.deleteObjectsAccumulator = new DeleteObjectsAccumulator(this::doDeleteObjects);
+        this.deleteObjectsAccumulator.start();
 
         s3LatencyCalculator = new S3LatencyCalculator(
             new long[] {
@@ -134,7 +139,7 @@ public abstract class AbstractObjectStorage implements ObjectStorage {
         if (!bucketCheck(options.bucket(), cf)) {
             return cf;
         }
-        if (end != -1L && start > end) {
+        if (end != RANGE_READ_TO_END && start > end) {
             IllegalArgumentException ex = new IllegalArgumentException();
             LOGGER.error("[UNEXPECTED] rangeRead [{}, {})", start, end, ex);
             cf.completeExceptionally(ex);
@@ -144,10 +149,32 @@ public abstract class AbstractObjectStorage implements ObjectStorage {
             return cf;
         }
 
-        TimerUtil timerUtil = new TimerUtil();
-        networkInboundBandwidthLimiter.consume(options.throttleStrategy(), end - start).whenComplete((v, ex) -> {
-            NetworkStats.getInstance().networkLimiterQueueTimeStats(AsyncNetworkBandwidthLimiter.Type.INBOUND, options.throttleStrategy())
-                .record(timerUtil.elapsedAs(TimeUnit.NANOSECONDS));
+        BiFunction<ThrottleStrategy, Long, CompletableFuture<Void>> networkInboundBandwidthLimiterFunction =
+            (throttleStrategy, size) -> {
+                long startTime = System.nanoTime();
+                return networkInboundBandwidthLimiter.consume(throttleStrategy, size)
+                    .whenComplete((v, ex) ->
+                        NetworkStats.getInstance()
+                            .networkLimiterQueueTimeStats(AsyncNetworkBandwidthLimiter.Type.INBOUND, throttleStrategy)
+                            .record(TimerUtil.durationElapsedAs(startTime, TimeUnit.NANOSECONDS)));
+
+            };
+
+        long acquiredSize = end - start;
+
+        if (end == RANGE_READ_TO_END) {
+            // we don't know the size so acquire size 1 first.
+            acquiredSize = 1;
+
+            // when read complete use bypass to forceConsume limiter token.
+            cf.whenComplete((data, ex) -> {
+                if (ex == null && data.readableBytes() - 1 > 0) {
+                    networkInboundBandwidthLimiterFunction.apply(ThrottleStrategy.BYPASS, (long) (data.readableBytes() - 1));
+                }
+            });
+        }
+
+        networkInboundBandwidthLimiterFunction.apply(options.throttleStrategy(), acquiredSize).whenComplete((v, ex) -> {
             if (ex != null) {
                 cf.completeExceptionally(ex);
             } else {
@@ -156,6 +183,7 @@ public abstract class AbstractObjectStorage implements ObjectStorage {
                 }
             }
         });
+
         Timeout timeout = timeoutDetect.newTimeout(t -> LOGGER.warn("rangeRead {} {}-{} timeout", objectPath, start, end), 1, TimeUnit.MINUTES);
         return cf.whenComplete((rst, ex) -> timeout.cancel());
     }
@@ -165,6 +193,7 @@ public abstract class AbstractObjectStorage implements ObjectStorage {
         CompletableFuture<Void> cf = new CompletableFuture<>();
         CompletableFuture<WriteResult> retCf = acquireWritePermit(cf).thenApply(nil -> new WriteResult(bucketURI.bucketId()));
         if (retCf.isDone()) {
+            data.release();
             return retCf;
         }
         TimerUtil timerUtil = new TimerUtil();
@@ -174,6 +203,7 @@ public abstract class AbstractObjectStorage implements ObjectStorage {
                 NetworkStats.getInstance().networkLimiterQueueTimeStats(AsyncNetworkBandwidthLimiter.Type.OUTBOUND, options.throttleStrategy())
                     .record(timerUtil.elapsedAs(TimeUnit.NANOSECONDS));
                 if (ex != null) {
+                    data.release();
                     cf.completeExceptionally(ex);
                 } else {
                     write0(options, objectPath, data, cf);
@@ -202,10 +232,9 @@ public abstract class AbstractObjectStorage implements ObjectStorage {
         // Fast retry should only be triggered by the original request.
         long delayMillis = s3LatencyCalculator.valueAtPercentile(objectSize, 99);
 
-        Optional<Timeout> fastRetryTask;
         if (options.enableFastRetry() && delayMillis > 0 && !options.retry()) {
             data.retain();
-            fastRetryTask = Optional.of(fastRetryTimer.newTimeout(timeout -> {
+            fastRetryTimer.newTimeout(timeout -> {
                 if (writeCf != null && !writeCf.isDone()) {
                     TimerUtil retryTimerUtil = new TimerUtil();
                     doWrite(retryOptions, path, data).thenAccept(nil -> {
@@ -213,9 +242,9 @@ public abstract class AbstractObjectStorage implements ObjectStorage {
                         data.release();
                         if (completedFlag.compareAndSet(false, true)) {
                             cf.complete(null);
-                            LOGGER.debug("Fast retry: put object {} with size {}, cost {}ms, delay {}ms", path, objectSize, retryTimerUtil.elapsedAs(TimeUnit.MILLISECONDS), delayMillis);
+                            LOGGER.info("Fast retry: put object {} with size {}, cost {}ms, delay {}ms", path, objectSize, retryTimerUtil.elapsedAs(TimeUnit.MILLISECONDS), delayMillis);
                         } else {
-                            LOGGER.debug("Fast retry but duplicated: put object {} with size {}, cost {}ms, delay {}ms", path, objectSize, retryTimerUtil.elapsedAs(TimeUnit.MILLISECONDS), delayMillis);
+                            LOGGER.info("Fast retry but duplicated: put object {} with size {}, cost {}ms, delay {}ms", path, objectSize, retryTimerUtil.elapsedAs(TimeUnit.MILLISECONDS), delayMillis);
                         }
                     }).exceptionally(ignore -> {
                         data.release();
@@ -226,9 +255,7 @@ public abstract class AbstractObjectStorage implements ObjectStorage {
                 } else {
                     data.release();
                 }
-            }, delayMillis, TimeUnit.MILLISECONDS));
-        } else {
-            fastRetryTask = Optional.empty();
+            }, delayMillis, TimeUnit.MILLISECONDS);
         }
 
         writeCf.thenAccept(nil -> {
@@ -236,7 +263,6 @@ public abstract class AbstractObjectStorage implements ObjectStorage {
             data.release();
             if (completedFlag.compareAndSet(false, true)) {
                 cf.complete(null);
-                fastRetryTask.ifPresent(Timeout::cancel);
             }
         }).exceptionally(ex -> {
             S3OperationStats.getInstance().putObjectStats(objectSize, false).record(timerUtil.elapsedAs(TimeUnit.NANOSECONDS));
@@ -293,12 +319,14 @@ public abstract class AbstractObjectStorage implements ObjectStorage {
         CompletableFuture<ObjectStorageCompletedPart> cf = new CompletableFuture<>();
         CompletableFuture<ObjectStorageCompletedPart> refCf = acquireWritePermit(cf);
         if (refCf.isDone()) {
+            data.release();
             return refCf;
         }
         networkOutboundBandwidthLimiter
             .consume(options.throttleStrategy(), data.readableBytes())
             .whenCompleteAsync((v, ex) -> {
                 if (ex != null) {
+                    data.release();
                     cf.completeExceptionally(ex);
                 } else {
                     uploadPart0(options, path, uploadId, partNumber, data, cf);
@@ -426,27 +454,9 @@ public abstract class AbstractObjectStorage implements ObjectStorage {
                 return cf;
             }
         }
-        TimerUtil timerUtil = new TimerUtil();
-        List<String> objectKeys = objectPaths.stream().map(ObjectPath::key).collect(Collectors.toList());
-        this.doDeleteObjects(objectKeys).thenAccept(nil -> {
-            LOGGER.info("Delete objects finished, count: {}, cost: {}ms", objectKeys.size(), timerUtil.elapsedAs(TimeUnit.MILLISECONDS));
-            S3OperationStats.getInstance().deleteObjectsStats(true).record(timerUtil.elapsedAs(TimeUnit.NANOSECONDS));
-            cf.complete(null);
-        }).exceptionally(ex -> {
-            if (ex instanceof DeleteObjectsException) {
-                DeleteObjectsException deleteObjectsException = (DeleteObjectsException) ex;
-                LOGGER.warn("Delete objects failed, count: {}, cost: {}, failedKeys: {}",
-                    deleteObjectsException.getFailedKeys().size(), timerUtil.elapsedAs(TimeUnit.NANOSECONDS),
-                    deleteObjectsException.getFailedKeys());
-            } else {
-                S3OperationStats.getInstance().deleteObjectsStats(false)
-                    .record(timerUtil.elapsedAs(TimeUnit.NANOSECONDS));
-                LOGGER.info("Delete objects failed, count: {}, cost: {}, ex: {}",
-                    objectKeys.size(), timerUtil.elapsedAs(TimeUnit.NANOSECONDS), ex.getMessage());
-            }
-            cf.completeExceptionally(ex);
-            return null;
-        });
+
+        deleteObjectsAccumulator.batchOrSubmitDeleteRequests(objectPaths, cf);
+
         return cf;
     }
 
@@ -466,6 +476,11 @@ public abstract class AbstractObjectStorage implements ObjectStorage {
     }
 
     @Override
+    public short bucketId() {
+        return bucketURI == null ? 0 : bucketURI.bucketId();
+    }
+
+    @Override
     public void close() {
         writeLimiterCallbackExecutor.shutdown();
         readCallbackExecutor.shutdown();
@@ -473,6 +488,7 @@ public abstract class AbstractObjectStorage implements ObjectStorage {
         scheduler.shutdown();
         timeoutDetect.stop();
         fastRetryTimer.stop();
+        deleteObjectsAccumulator.stop();
         doClose();
     }
 
@@ -578,12 +594,14 @@ public abstract class AbstractObjectStorage implements ObjectStorage {
         TimerUtil timerUtil = new TimerUtil();
         long size = end - start;
         doRangeRead(options, path, start, end).thenAccept(buf -> {
+            // the end may be RANGE_READ_TO_END (-1) for read all object
+            long dataSize = buf.readableBytes();
             if (LOGGER.isDebugEnabled()) {
                 LOGGER.debug("[S3BlockCache] getObject from path: {}, {}-{}, size: {}, cost: {} ms",
-                    path, start, end, size, timerUtil.elapsedAs(TimeUnit.MILLISECONDS));
+                    path, start, end, dataSize, timerUtil.elapsedAs(TimeUnit.MILLISECONDS));
             }
-            S3OperationStats.getInstance().downloadSizeTotalStats.add(MetricsLevel.INFO, size);
-            S3OperationStats.getInstance().getObjectStats(size, true).record(timerUtil.elapsedAs(TimeUnit.NANOSECONDS));
+            S3OperationStats.getInstance().downloadSizeTotalStats.add(MetricsLevel.INFO, dataSize);
+            S3OperationStats.getInstance().getObjectStats(dataSize, true).record(timerUtil.elapsedAs(TimeUnit.NANOSECONDS));
             cf.complete(buf);
         }).exceptionally(ex -> {
             Pair<RetryStrategy, Throwable> strategyAndCause = toRetryStrategyAndCause(ex, S3Operation.GET_OBJECT);
@@ -759,7 +777,7 @@ public abstract class AbstractObjectStorage implements ObjectStorage {
             return objectPath != null &&
                    objectPath.equals(readTask.objectPath) &&
                    dataSparsityRate <= this.maxMergeReadSparsityRate &&
-                   readTask.end != -1;
+                   readTask.end != RANGE_READ_TO_END;
         }
 
         void handleReadCompleted(ByteBuf rst, Throwable ex) {
@@ -768,7 +786,7 @@ public abstract class AbstractObjectStorage implements ObjectStorage {
             } else {
                 for (AbstractObjectStorage.ReadTask readTask : readTasks) {
                     int sliceStart = (int) (readTask.start - start);
-                    if (readTask.end == -1L) {
+                    if (readTask.end == RANGE_READ_TO_END) {
                         readTask.cf.complete(rst.retainedSlice(sliceStart, rst.readableBytes()));
                     } else {
                         readTask.cf.complete(rst.retainedSlice(sliceStart, (int) (readTask.end - readTask.start)));

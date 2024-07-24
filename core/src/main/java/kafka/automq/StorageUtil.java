@@ -1,5 +1,5 @@
 /*
- * Copyright 2024, AutoMQ CO.,LTD.
+ * Copyright 2024, AutoMQ HK Limited.
  *
  * Use of this software is governed by the Business Source License
  * included in the file BSL.md
@@ -48,14 +48,7 @@ public class StorageUtil {
                 Files.createDirectories(dir);
             }
             try (BufferedWriter writer = new BufferedWriter(new FileWriter(configFilePath, StandardCharsets.UTF_8))) {
-                serverProps.forEach((key, value) -> {
-                    try {
-                        writer.write(key + "=" + value + "\n");
-                    } catch (Exception e) {
-                        throw new RuntimeException(e);
-                    }
-
-                });
+                serverProps.store(writer, null);
                 return configFilePath;
             }
         } catch (Throwable e) {

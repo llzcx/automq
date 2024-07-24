@@ -1,5 +1,5 @@
 /*
- * Copyright 2024, AutoMQ CO.,LTD.
+ * Copyright 2024, AutoMQ HK Limited.
  *
  * Use of this software is governed by the Business Source License
  * included in the file BSL.md
@@ -26,6 +26,7 @@ import com.automq.stream.s3.failover.Failover;
 import com.automq.stream.s3.failover.FailoverFactory;
 import com.automq.stream.s3.failover.FailoverRequest;
 import com.automq.stream.s3.failover.FailoverResponse;
+import com.automq.stream.s3.index.LocalStreamRangeIndexCache;
 import com.automq.stream.s3.network.AsyncNetworkBandwidthLimiter;
 import com.automq.stream.s3.objects.ObjectManager;
 import com.automq.stream.s3.operator.BucketURI;
@@ -48,12 +49,14 @@ import kafka.log.stream.s3.objects.ControllerObjectManager;
 import kafka.log.stream.s3.streams.ControllerStreamManager;
 import kafka.server.BrokerServer;
 import org.apache.commons.lang3.StringUtils;
+import org.apache.kafka.image.MetadataImage;
+import org.apache.kafka.server.common.automq.AutoMQVersion;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 public class DefaultS3Client implements Client {
     private final static Logger LOGGER = LoggerFactory.getLogger(DefaultS3Client.class);
-    private final Config config;
+    protected final Config config;
     private final StreamMetadataManager metadataManager;
 
     private final ControllerRequestSender requestSender;
@@ -80,6 +83,7 @@ public class DefaultS3Client implements Client {
     private final AsyncNetworkBandwidthLimiter networkOutboundLimiter;
 
     private final BrokerServer brokerServer;
+    private final LocalStreamRangeIndexCache localIndexCache;
 
     public DefaultS3Client(BrokerServer brokerServer, Config config) {
         this.brokerServer = brokerServer;
@@ -107,17 +111,22 @@ public class DefaultS3Client implements Client {
             .inboundLimiter(networkInboundLimiter).outboundLimiter(networkOutboundLimiter).build();
         ControllerRequestSender.RetryPolicyContext retryPolicyContext = new ControllerRequestSender.RetryPolicyContext(config.controllerRequestRetryMaxCount(),
             config.controllerRequestRetryBaseDelayMs());
+        localIndexCache = new LocalStreamRangeIndexCache();
+        localIndexCache.start();
+        localIndexCache.init(config.nodeId(), objectStorage);
         this.objectReaderFactory = new DefaultObjectReaderFactory(objectStorage);
-        this.metadataManager = new StreamMetadataManager(brokerServer, config.nodeId(), objectReaderFactory);
+        this.metadataManager = new StreamMetadataManager(brokerServer, config.nodeId(), objectReaderFactory, localIndexCache);
         this.requestSender = new ControllerRequestSender(brokerServer, retryPolicyContext);
         this.streamManager = newStreamManager(config.nodeId(), config.nodeEpoch(), false);
         this.objectManager = newObjectManager(config.nodeId(), config.nodeEpoch(), false);
+        this.objectManager.setCommitStreamSetObjectHook(localIndexCache::updateIndexFromRequest);
         this.blockCache = new StreamReaders(this.config.blockCacheSize(), objectManager, objectStorage, objectReaderFactory);
         this.compactionManager = new CompactionManager(this.config, this.objectManager, this.streamManager, compactionobjectStorage);
         this.writeAheadLog = buildWAL();
         this.storage = new S3Storage(this.config, writeAheadLog, streamManager, objectManager, blockCache, objectStorage);
         // stream object compactions share the same object storage with stream set object compactions
         this.streamClient = new S3StreamClient(this.streamManager, this.storage, this.objectManager, compactionobjectStorage, this.config, networkInboundLimiter, networkOutboundLimiter);
+        this.streamClient.registerStreamLifeCycleListener(localIndexCache);
         this.kvClient = new ControllerKVClient(this.requestSender);
         this.failover = failover();
 
@@ -125,7 +134,7 @@ public class DefaultS3Client implements Client {
         S3StreamThreadPoolMonitor.init();
     }
 
-    private WriteAheadLog buildWAL() {
+    protected WriteAheadLog buildWAL() {
         BucketURI bucketURI;
         try {
             bucketURI = BucketURI.parse(config.walPath());
@@ -143,7 +152,8 @@ public class DefaultS3Client implements Client {
                 ObjectWALConfig.Builder configBuilder = ObjectWALConfig.builder()
                     .withClusterId(brokerServer.clusterId())
                     .withNodeId(config.nodeId())
-                    .withEpoch(config.nodeEpoch());
+                    .withEpoch(config.nodeEpoch())
+                    .withBucketId(bucketURI.bucketId());
 
                 String batchInterval = bucketURI.extensionString("batchInterval");
                 if (StringUtils.isNumeric(batchInterval)) {
@@ -205,11 +215,13 @@ public class DefaultS3Client implements Client {
     }
 
     StreamManager newStreamManager(int nodeId, long nodeEpoch, boolean failoverMode) {
-        return new ControllerStreamManager(this.metadataManager, this.requestSender, nodeId, nodeEpoch, () -> brokerServer.metadataCache().autoMQVersion(), failoverMode);
+        return new ControllerStreamManager(this.metadataManager, this.requestSender, nodeId, nodeEpoch,
+            this::getAutoMQVersion, failoverMode);
     }
 
     ObjectManager newObjectManager(int nodeId, long nodeEpoch, boolean failoverMode) {
-        return new ControllerObjectManager(this.requestSender, this.metadataManager, nodeId, nodeEpoch, () -> brokerServer.metadataCache().autoMQVersion(), failoverMode);
+        return new ControllerObjectManager(this.requestSender, this.metadataManager, nodeId, nodeEpoch,
+            this::getAutoMQVersion, failoverMode);
     }
 
     Failover failover() {
@@ -230,5 +242,12 @@ public class DefaultS3Client implements Client {
                 throw new RuntimeException(e);
             }
         });
+    }
+
+    private AutoMQVersion getAutoMQVersion() {
+        if (brokerServer.metadataCache().currentImage() == MetadataImage.EMPTY) {
+            throw new IllegalStateException("The image should be loaded first");
+        }
+        return brokerServer.metadataCache().autoMQVersion();
     }
 }
