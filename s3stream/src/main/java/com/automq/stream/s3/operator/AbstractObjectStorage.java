@@ -21,6 +21,7 @@ import com.automq.stream.s3.metrics.stats.StorageOperationStats;
 import com.automq.stream.s3.network.AsyncNetworkBandwidthLimiter;
 import com.automq.stream.s3.network.NetworkBandwidthLimiter;
 import com.automq.stream.s3.network.ThrottleStrategy;
+import com.automq.stream.s3.objects.ObjectAttributes;
 import com.automq.stream.utils.FutureUtil;
 import com.automq.stream.utils.ThreadUtils;
 import com.automq.stream.utils.Threads;
@@ -451,6 +452,7 @@ public abstract class AbstractObjectStorage implements ObjectStorage {
         CompletableFuture<Void> cf = new CompletableFuture<>();
         for (ObjectPath objectPath : objectPaths) {
             if (!bucketCheck(objectPath.bucketId(), cf)) {
+                LOGGER.error("[BUG] {} bucket check fail, expect {}", objectPath, bucketId());
                 return cf;
             }
         }
@@ -694,6 +696,9 @@ public abstract class AbstractObjectStorage implements ObjectStorage {
     }
 
     protected <T> boolean bucketCheck(int bucketId, CompletableFuture<T> cf) {
+        if (bucketId == ObjectAttributes.MATCH_ALL_BUCKET) {
+            return true;
+        }
         if (bucketId != bucketURI.bucketId()) {
             cf.completeExceptionally(new IllegalArgumentException(String.format("bucket not match, expect %d, actual %d",
                 bucketURI.bucketId(), bucketId)));
@@ -784,15 +789,20 @@ public abstract class AbstractObjectStorage implements ObjectStorage {
             if (ex != null) {
                 readTasks.forEach(readTask -> readTask.cf.completeExceptionally(ex));
             } else {
+                ArrayList<ByteBuf> sliceByteBufList = new ArrayList<>();
                 for (AbstractObjectStorage.ReadTask readTask : readTasks) {
                     int sliceStart = (int) (readTask.start - start);
                     if (readTask.end == RANGE_READ_TO_END) {
-                        readTask.cf.complete(rst.retainedSlice(sliceStart, rst.readableBytes()));
+                        sliceByteBufList.add(rst.retainedSlice(sliceStart, rst.readableBytes()));
                     } else {
-                        readTask.cf.complete(rst.retainedSlice(sliceStart, (int) (readTask.end - readTask.start)));
+                        sliceByteBufList.add(rst.retainedSlice(sliceStart, (int) (readTask.end - readTask.start)));
                     }
                 }
                 rst.release();
+                for (int i = 0; i < readTasks.size(); i++) {
+                    readTasks.get(i).cf.complete(sliceByteBufList.get(i));
+                }
+
             }
         }
     }
