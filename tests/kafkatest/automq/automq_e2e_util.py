@@ -15,6 +15,10 @@
 import re
 import time
 
+from kafkatest.services.console_consumer import ConsoleConsumer
+from kafkatest.services.performance import ProducerPerformanceService
+from kafkatest.version import DEV_BRANCH
+
 
 def formatted_time(msg):
     """
@@ -104,3 +108,69 @@ def publish_broker_configuration(kafka, producer_byte_rate, consumer_byte_rate, 
     cmd += " --entity-type " + 'brokers'
     cmd += " --entity-name " + broker_id
     node.account.ssh(cmd)
+
+
+RECORD_SIZE = 3000
+RECORD_NUM = 50000
+TOPIC = 'test_topic'
+CONSUMER_GROUP = "test_consume_group"
+DEFAULT_CONSUMER_CLIENT_ID = 'test_producer_client_id'
+DEFAULT_PRODUCER_CLIENT_ID = 'test_producer_client_id'
+BATCH_SIZE = 16 * 1024
+BUFFER_MEMORY = 64 * 1024 * 1024
+DEFAULT_THROUGHPUT = -1
+DEFAULT_CLIENT_VERSION = DEV_BRANCH
+JMX_BROKER_IN = 'kafka.server:type=BrokerTopicMetrics,name=BytesInPerSec'
+JMX_BROKER_OUT = 'kafka.server:type=BrokerTopicMetrics,name=BytesOutPerSec'
+JMX_TOPIC_IN = f'kafka.server:type=BrokerTopicMetrics,name=BytesInPerSec,topic={TOPIC}'
+JMX_TOPIC_OUT = f'kafka.server:type=BrokerTopicMetrics,name=BytesOutPerSec,topic={TOPIC}'
+JMX_ONE_MIN = ':OneMinuteRate'
+
+
+def run_perf_producer(test_context, kafka, num_records=RECORD_NUM, throughput=DEFAULT_THROUGHPUT,
+                      client_version=DEFAULT_CLIENT_VERSION, topic=TOPIC):
+    producer = ProducerPerformanceService(
+        test_context, 1, kafka,
+        topic=topic, num_records=num_records, record_size=RECORD_SIZE, throughput=throughput,
+        client_id=DEFAULT_PRODUCER_CLIENT_ID, version=client_version,
+        settings={
+            'acks': 1,
+            'compression.type': "none",
+            'batch.size': BATCH_SIZE,
+            'buffer.memory': BUFFER_MEMORY
+        })
+    producer.run()
+    return producer
+
+
+def run_console_consumer(test_context, kafka, client_version=DEFAULT_CLIENT_VERSION, topic=TOPIC):
+    consumer = ConsoleConsumer(test_context, 1, topic=topic, kafka=kafka,
+                               consumer_timeout_ms=60000, client_id=DEFAULT_CONSUMER_CLIENT_ID,
+                               jmx_object_names=[
+                                   'kafka.consumer:type=consumer-fetch-manager-metrics,client-id=%s' % DEFAULT_CONSUMER_CLIENT_ID],
+                               jmx_attributes=['bytes-consumed-rate'], version=client_version)
+    consumer.run()
+    for idx, messages in consumer.messages_consumed.items():
+        assert len(messages) > 0, "consumer %d didn't consume any message before timeout" % idx
+    return consumer
+
+
+def validate_num(producer, consumer, logger):
+    success = True
+    msg = ''
+    # validate that number of consumed messages equals number of produced messages
+    produced_num = sum([value['records'] for value in producer.results])
+    consumed_num = sum([len(value) for value in consumer.messages_consumed.values()])
+    logger.info('producer produced %d messages' % produced_num)
+    logger.info('consumer consumed %d messages' % consumed_num)
+    if produced_num != consumed_num:
+        success = False
+        msg += "number of produced messages %d doesn't equal number of consumed messages %d\n" % (
+            produced_num, consumed_num)
+    return success, msg
+
+
+def run_simple_load(test_context, kafka, logger, topic=TOPIC, num_records=RECORD_NUM):
+    producer = run_perf_producer(test_context=test_context, kafka=kafka, topic=topic, num_records=num_records)
+    consumer = run_console_consumer(test_context=test_context, kafka=kafka)
+    return validate_num(producer, consumer, logger)
