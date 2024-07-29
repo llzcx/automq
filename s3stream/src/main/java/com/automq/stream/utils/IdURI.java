@@ -12,6 +12,8 @@
 package com.automq.stream.utils;
 
 import java.net.URI;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
 import java.util.regex.Matcher;
@@ -38,6 +40,13 @@ public class IdURI {
         this.extension = URIUtils.splitQuery(uri);
     }
 
+    private IdURI(short id, String protocol, String path, Map<String, List<String>> extension) {
+        this.id = id;
+        this.protocol = protocol;
+        this.path = path;
+        this.extension = extension;
+    }
+
     public static IdURI parse(String raw) {
         Matcher matcher = URI_PATTERN.matcher(raw);
         if (!matcher.find()) {
@@ -62,6 +71,14 @@ public class IdURI {
 
     public String path() {
         return path;
+    }
+
+    public IdURI path(String newPath) {
+        return new IdURI(id, protocol, newPath, extension);
+    }
+
+    public Map<String, List<String>> extension() {
+        return extension;
     }
 
     public String extensionString(String key) {
@@ -92,4 +109,17 @@ public class IdURI {
         return Long.parseLong(value);
     }
 
+    public String encode() {
+        StringBuilder raw = new StringBuilder(id() + "@" + protocol() + "://" + path());
+        if (extension.isEmpty()) {
+            return raw.toString();
+        }
+        raw.append("?");
+        for (Map.Entry<String, List<String>> entry : extension().entrySet()) {
+            for (String value : entry.getValue()) {
+                raw.append(URLEncoder.encode(entry.getKey(), StandardCharsets.UTF_8)).append("=").append(URLEncoder.encode(value, StandardCharsets.UTF_8)).append("&");
+            }
+        }
+        return raw.substring(0, raw.length() - 1);
+    }
 }
