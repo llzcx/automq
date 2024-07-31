@@ -1,8 +1,8 @@
 /*
  * Copyright 2024, AutoMQ HK Limited.
  *
- * Use of this software is governed by the Business Source License
- * included in the file BSL.md
+ * The use of this file is governed by the Business Source License,
+ * as detailed in the file "/LICENSE.S3Stream" included in this repository.
  *
  * As of the Change Date specified in that file, in accordance with
  * the Business Source License, use of this software will be governed
@@ -22,6 +22,7 @@ public enum AutoMQVersion {
     // Support composite object
     // Support object bucket index
     // Support huge cluster
+    // Support node registration
     V2((short) 3);
 
     public static final String FEATURE_NAME = "automq.version";
@@ -77,6 +78,10 @@ public enum AutoMQVersion {
     }
 
     public boolean isHugeClusterSupported() {
+        return isAtLeast(V2);
+    }
+
+    public boolean isNodeRegistrationSupported() {
         return isAtLeast(V2);
     }
 

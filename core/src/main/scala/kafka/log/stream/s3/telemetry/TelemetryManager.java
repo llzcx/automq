@@ -1,8 +1,8 @@
 /*
  * Copyright 2024, AutoMQ HK Limited.
  *
- * Use of this software is governed by the Business Source License
- * included in the file BSL.md
+ * The use of this file is governed by the Business Source License,
+ * as detailed in the file "/LICENSE.S3Stream" included in this repository.
  *
  * As of the Change Date specified in that file, in accordance with
  * the Business Source License, use of this software will be governed
@@ -25,7 +25,6 @@ import io.opentelemetry.context.propagation.TextMapPropagator;
 import io.opentelemetry.instrumentation.jmx.engine.JmxMetricInsight;
 import io.opentelemetry.instrumentation.jmx.engine.MetricConfiguration;
 import io.opentelemetry.instrumentation.jmx.yaml.RuleParser;
-import io.opentelemetry.instrumentation.runtimemetrics.java8.BufferPools;
 import io.opentelemetry.instrumentation.runtimemetrics.java8.Cpu;
 import io.opentelemetry.instrumentation.runtimemetrics.java8.GarbageCollector;
 import io.opentelemetry.instrumentation.runtimemetrics.java8.MemoryPools;
@@ -37,7 +36,6 @@ import io.opentelemetry.sdk.metrics.SdkMeterProviderBuilder;
 import io.opentelemetry.sdk.metrics.export.MetricReader;
 import io.opentelemetry.sdk.metrics.internal.SdkMeterProviderUtil;
 import io.opentelemetry.sdk.resources.Resource;
-import io.opentelemetry.semconv.ResourceAttributes;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.InetAddress;
@@ -112,32 +110,31 @@ public class TelemetryManager {
     }
 
     protected SdkMeterProvider buildMeterProvider(KafkaConfig kafkaConfig) {
-        MetricsExporterURI metricsExporterURI = buildMetricsExporterURI(clusterId, kafkaConfig);
         Resource resource = Resource.empty().toBuilder()
             .putAll(Attributes.builder()
-                .put(ResourceAttributes.SERVICE_NAME, clusterId)
-                .put(ResourceAttributes.SERVICE_INSTANCE_ID, String.valueOf(kafkaConfig.nodeId()))
-                .put(ResourceAttributes.HOST_NAME, getHostName())
-                .put("instance", String.valueOf(kafkaConfig.nodeId())) // for Aliyun Prometheus compatibility
-                .put("node_type", getNodeType())
+                .put(MetricsConstants.SERVICE_NAME, clusterId)
+                .put(MetricsConstants.SERVICE_INSTANCE, String.valueOf(kafkaConfig.nodeId()))
+                .put(MetricsConstants.HOST_NAME, getHostName())
+                .put(MetricsConstants.JOB, clusterId) // for Prometheus HTTP server compatibility
+                .put(MetricsConstants.INSTANCE, String.valueOf(kafkaConfig.nodeId())) // for Aliyun Prometheus compatibility
+                .put(MetricsConstants.NODE_TYPE, getNodeType())
                 .build())
             .build();
         SdkMeterProviderBuilder sdkMeterProviderBuilder = SdkMeterProvider.builder().setResource(resource);
-        for (MetricsExporter metricsExporter : metricsExporterURI.metricsExporters()) {
-            MetricReader metricReader = metricsExporter.asMetricReader();
-            metricReaderList.add(metricReader);
-            SdkMeterProviderUtil.registerMetricReaderWithCardinalitySelector(sdkMeterProviderBuilder, metricReader,
-                instrumentType -> TelemetryConstants.CARDINALITY_LIMIT);
+        MetricsExporterURI metricsExporterURI = buildMetricsExporterURI(clusterId, kafkaConfig);
+        if (metricsExporterURI != null) {
+            for (MetricsExporter metricsExporter : metricsExporterURI.metricsExporters()) {
+                MetricReader metricReader = metricsExporter.asMetricReader();
+                metricReaderList.add(metricReader);
+                SdkMeterProviderUtil.registerMetricReaderWithCardinalitySelector(sdkMeterProviderBuilder, metricReader,
+                    instrumentType -> TelemetryConstants.CARDINALITY_LIMIT);
+            }
         }
         return sdkMeterProviderBuilder.build();
     }
 
     protected MetricsExporterURI buildMetricsExporterURI(String clusterId, KafkaConfig kafkaConfig) {
-        MetricsExporterURI metricsExporterURI = MetricsExporterURI.parse(clusterId, kafkaConfig);
-        if (metricsExporterURI.metricsExporters().isEmpty()) {
-            LOGGER.info("No valid metrics exporter found");
-        }
-        return metricsExporterURI;
+        return MetricsExporterURI.parse(clusterId, kafkaConfig);
     }
 
     protected void initializeMetricsManager(Meter meter) {
@@ -181,7 +178,6 @@ public class TelemetryManager {
         autoCloseableList.addAll(MemoryPools.registerObservers(openTelemetry));
         autoCloseableList.addAll(Cpu.registerObservers(openTelemetry));
         autoCloseableList.addAll(GarbageCollector.registerObservers(openTelemetry));
-        autoCloseableList.addAll(BufferPools.registerObservers(openTelemetry));
         autoCloseableList.addAll(Threads.registerObservers(openTelemetry));
     }
 

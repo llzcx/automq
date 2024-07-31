@@ -759,6 +759,14 @@ public final class QuorumController implements Controller {
     public SnapshotRegistry snapshotRegistry() {
         return snapshotRegistry;
     }
+
+    public NodeControlManager nodeControlManager() {
+        return nodeControlManager;
+    }
+
+    public FeatureControlManager featureControlManager() {
+        return featureControl;
+    }
     // AutoMQ for Kafka inject end
 
     // Visible for testing

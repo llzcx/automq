@@ -1,8 +1,8 @@
 /*
  * Copyright 2024, AutoMQ HK Limited.
  *
- * Use of this software is governed by the Business Source License
- * included in the file BSL.md
+ * The use of this file is governed by the Business Source License,
+ * as detailed in the file "/LICENSE.S3Stream" included in this repository.
  *
  * As of the Change Date specified in that file, in accordance with
  * the Business Source License, use of this software will be governed
@@ -13,7 +13,6 @@ package com.automq.stream.s3.metrics;
 
 import com.automq.stream.s3.ByteBufAlloc;
 import com.automq.stream.s3.metrics.operations.S3ObjectStage;
-import com.automq.stream.s3.metrics.operations.S3Operation;
 import com.automq.stream.s3.metrics.operations.S3Stage;
 import com.automq.stream.s3.metrics.wrapper.ConfigListener;
 import com.automq.stream.s3.metrics.wrapper.CounterMetric;
@@ -65,6 +64,7 @@ public class S3StreamMetricsManager {
     private static HistogramInstrument getIndexTime;
     private static HistogramInstrument readBlockCacheTime;
     private static ObservableLongGauge deltaWalStartOffset = new NoopObservableLongGauge();
+    private static ObservableLongGauge pendUploadWalBytes = new NoopObservableLongGauge();
     private static ObservableLongGauge deltaWalTrimmedOffset = new NoopObservableLongGauge();
     private static ObservableLongGauge deltaWalCacheSize = new NoopObservableLongGauge();
     private static ObservableLongGauge blockCacheSize = new NoopObservableLongGauge();
@@ -85,6 +85,7 @@ public class S3StreamMetricsManager {
     private static Supplier<Integer> networkOutboundLimiterQueueSizeSupplier = () -> 0;
     private static Supplier<Integer> availableInflightReadAheadSizeSupplier = () -> 0;
     private static Supplier<Long> deltaWalStartOffsetSupplier = () -> 0L;
+    private static Supplier<Long> deltaWalPendingUploadBytesSupplier = () -> 0L;
     private static Supplier<Long> deltaWalTrimmedOffsetSupplier = () -> 0L;
     private static Supplier<Long> deltaWALCacheSizeSupplier = () -> 0L;
     private static Supplier<Long> blockCacheSizeSupplier = () -> 0L;
@@ -203,6 +204,14 @@ public class S3StreamMetricsManager {
                     result.record(deltaWalStartOffsetSupplier.get(), metricsConfig.getBaseAttributes());
                 }
             });
+
+        pendUploadWalBytes = meter.gaugeBuilder(prefix + S3StreamMetricsConstant.WAL_PENDING_UPLOAD_BYTES)
+            .setDescription("Delta WAL pending upload bytes")
+            .ofLongs()
+            .buildWithCallback(result -> {
+                result.record(deltaWalPendingUploadBytesSupplier.get(), metricsConfig.getBaseAttributes());
+            });
+
         deltaWalTrimmedOffset = meter.gaugeBuilder(prefix + S3StreamMetricsConstant.WAL_TRIMMED_OFFSET)
             .setDescription("Delta WAL trimmed offset")
             .ofLongs()
@@ -351,6 +360,10 @@ public class S3StreamMetricsManager {
         S3StreamMetricsManager.deltaWalTrimmedOffsetSupplier = deltaWalTrimmedOffsetSupplier;
     }
 
+    public static void registerDeltaWalPendingUploadBytesSupplier(Supplier<Long> deltaWalPendingUploadBytesSupplier) {
+        S3StreamMetricsManager.deltaWalPendingUploadBytesSupplier = deltaWalPendingUploadBytesSupplier;
+    }
+
     public static void registerDeltaWalCacheSizeSupplier(Supplier<Long> deltaWalCacheSizeSupplier) {
         S3StreamMetricsManager.deltaWALCacheSizeSupplier = deltaWalCacheSizeSupplier;
     }
@@ -403,31 +416,31 @@ public class S3StreamMetricsManager {
         }
     }
 
-    public static HistogramMetric buildOperationMetric(MetricsLevel metricsLevel, S3Operation operation) {
+    public static HistogramMetric buildOperationMetric(MetricsLevel metricsLevel, String operationType, String operationName) {
         synchronized (BASE_ATTRIBUTES_LISTENERS) {
             HistogramMetric metric = new HistogramMetric(metricsLevel, metricsConfig,
-                    AttributesUtils.buildAttributes(operation));
+                    AttributesUtils.buildOperationAttributes(operationType, operationName));
             BASE_ATTRIBUTES_LISTENERS.add(metric);
             OPERATION_LATENCY_METRICS.add(metric);
             return metric;
         }
     }
 
-    public static HistogramMetric buildOperationMetric(MetricsLevel metricsLevel,
-                                                       S3Operation operation, String status, String sizeLabelName) {
+    public static HistogramMetric buildOperationMetric(MetricsLevel metricsLevel, String operationType,
+        String operationName, String status, String sizeLabelName) {
         synchronized (BASE_ATTRIBUTES_LISTENERS) {
             HistogramMetric metric = new HistogramMetric(metricsLevel, metricsConfig,
-                    AttributesUtils.buildAttributes(operation, status, sizeLabelName));
+                    AttributesUtils.buildOperationAttributesWithStatusAndSize(operationType, operationName, status, sizeLabelName));
             BASE_ATTRIBUTES_LISTENERS.add(metric);
             OPERATION_LATENCY_METRICS.add(metric);
             return metric;
         }
     }
 
-    public static HistogramMetric buildOperationMetric(MetricsLevel metricsLevel, S3Operation operation, String status) {
+    public static HistogramMetric buildOperationMetric(MetricsLevel metricsLevel, String operationType, String operationName, String status) {
         synchronized (BASE_ATTRIBUTES_LISTENERS) {
             HistogramMetric metric = new HistogramMetric(metricsLevel, metricsConfig,
-                    AttributesUtils.buildAttributes(operation, status));
+                    AttributesUtils.buildOperationAttributesWithStatus(operationType, operationName, status));
             BASE_ATTRIBUTES_LISTENERS.add(metric);
             OPERATION_LATENCY_METRICS.add(metric);
             return metric;

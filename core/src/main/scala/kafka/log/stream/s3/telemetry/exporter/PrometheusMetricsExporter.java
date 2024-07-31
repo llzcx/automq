@@ -1,8 +1,8 @@
 /*
  * Copyright 2024, AutoMQ HK Limited.
  *
- * Use of this software is governed by the Business Source License
- * included in the file BSL.md
+ * The use of this file is governed by the Business Source License,
+ * as detailed in the file "/LICENSE.S3Stream" included in this repository.
  *
  * As of the Change Date specified in that file, in accordance with
  * the Business Source License, use of this software will be governed
@@ -13,6 +13,7 @@ package kafka.log.stream.s3.telemetry.exporter;
 
 import io.opentelemetry.exporter.prometheus.PrometheusHttpServer;
 import io.opentelemetry.sdk.metrics.export.MetricReader;
+import kafka.log.stream.s3.telemetry.MetricsConstants;
 import org.apache.kafka.common.utils.Utils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -47,6 +48,9 @@ public class PrometheusMetricsExporter implements MetricsExporter {
         return PrometheusHttpServer.builder()
             .setHost(host)
             .setPort(port)
+            .setAllowedResourceAttributesFilter(resourceAttributes ->
+                MetricsConstants.JOB.equals(resourceAttributes)
+                    || MetricsConstants.INSTANCE.equals(resourceAttributes))
             .build();
     }
 }
