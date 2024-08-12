@@ -54,6 +54,8 @@ import org.apache.kafka.timeline.TimelineHashMap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import static com.automq.stream.utils.FutureUtil.exec;
+
 public final class S3StreamsMetadataImage extends AbstractReferenceCounted {
     private static final Logger LOGGER = LoggerFactory.getLogger(S3StreamsMetadataImage.class);
 
@@ -186,7 +188,22 @@ public final class S3StreamsMetadataImage extends AbstractReferenceCounted {
             null, null);
     }
 
-    void fillObjects(
+    private void fillObjects(
+        GetObjectsContext ctx,
+        S3StreamMetadataImage stream,
+        List<S3ObjectMetadata> objects,
+        int lastRangeIndex,
+        int streamObjectIndex,
+        List<S3StreamObject> streamObjects,
+        int streamSetObjectIndex,
+        List<S3StreamSetObject> streamSetObjects,
+        NodeS3StreamSetObjectMetadataImage node
+    ) {
+        exec(() -> fillObjects0(ctx, stream, objects, lastRangeIndex, streamObjectIndex, streamObjects,
+            streamSetObjectIndex, streamSetObjects, node), ctx.cf, LOGGER, "fillObjects");
+    }
+
+    void fillObjects0(
         GetObjectsContext ctx,
         S3StreamMetadataImage stream,
         List<S3ObjectMetadata> objects,
@@ -249,6 +266,7 @@ public final class S3StreamsMetadataImage extends AbstractReferenceCounted {
                 final NodeS3StreamSetObjectMetadataImage finalNode = node;
                 startSearchIndexCf.whenComplete((index, ex) -> {
                     if (ex != null) {
+                        LOGGER.error("Failed to get start search index", ex);
                         index = 0;
                     }
                     // load stream set object index
@@ -257,6 +275,9 @@ public final class S3StreamsMetadataImage extends AbstractReferenceCounted {
                         ctx.nextStartOffset = finalNextStartOffset;
                         fillObjects(ctx, stream, objects, finalLastRangeIndex, finalStreamObjectIndex, streamObjects,
                             finalIndex, finalStreamSetObjects, finalNode);
+                    }).exceptionally(exception -> {
+                        ctx.cf.completeExceptionally(exception);
+                        return null;
                     });
                 });
                 return;
@@ -345,23 +366,14 @@ public final class S3StreamsMetadataImage extends AbstractReferenceCounted {
         return null;
     }
 
-    private int findStartSearchIndex(long startObjectId, List<S3StreamSetObject> streamSetObjects, int nodeId) {
-        int startSearchIndex = 0;
-        if (startObjectId >= 0) {
-            boolean found = false;
-            for (int i = 0; i < streamSetObjects.size(); i++) {
-                S3StreamSetObject sso = streamSetObjects.get(i);
-                if (Objects.equals(sso.objectId(), startObjectId)) {
-                    found = true;
-                    startSearchIndex = i;
-                    break;
-                }
-            }
-            if (!found) {
-                NodeRangeIndexCache.getInstance().invalidate(nodeId);
+    private int findStartSearchIndex(long startObjectId, List<S3StreamSetObject> streamSetObjects) {
+        for (int i = 0; i < streamSetObjects.size(); i++) {
+            S3StreamSetObject sso = streamSetObjects.get(i);
+            if (Objects.equals(sso.objectId(), startObjectId)) {
+                return i;
             }
         }
-        return startSearchIndex;
+        return -1;
     }
 
     /**
@@ -379,7 +391,14 @@ public final class S3StreamsMetadataImage extends AbstractReferenceCounted {
         }
         // search in sparse index
         return getStartStreamSetObjectId(node.getNodeId(), startOffset, ctx)
-            .thenApply(objectId -> findStartSearchIndex(objectId, node.orderList(), node.getNodeId()));
+            .thenApply(objectId -> {
+                int startIndex = findStartSearchIndex(objectId, node.orderList());
+                if (startIndex < 0 && ctx.indexCache.nodeId() != node.getNodeId()) {
+                    LOGGER.info("Stream set object {} not found in node {}, invalidate index cache", objectId, node.getNodeId());
+                    NodeRangeIndexCache.getInstance().invalidate(node.getNodeId());
+                }
+                return Math.max(0, startIndex);
+            });
     }
 
     /**
@@ -417,30 +436,28 @@ public final class S3StreamsMetadataImage extends AbstractReferenceCounted {
     private CompletableFuture<Void> loadStreamSetObjectInfo(GetObjectsContext ctx,
         List<S3StreamSetObject> streamSetObjects,
         int startSearchIndex) {
-        final int streamSetObjectsSize = streamSetObjects.size();
-        List<CompletableFuture<Void>> loadIndexCfList = new LinkedList<>();
-        for (int i = startSearchIndex; i < streamSetObjectsSize; i++) {
-            S3StreamSetObject streamSetObject = streamSetObjects.get(i);
-            if (streamSetObject.ranges().length != 0) {
-                continue;
+        return exec(() -> {
+            final int streamSetObjectsSize = streamSetObjects.size();
+            List<CompletableFuture<Void>> loadIndexCfList = new LinkedList<>();
+            for (int i = startSearchIndex; i < streamSetObjectsSize; i++) {
+                S3StreamSetObject streamSetObject = streamSetObjects.get(i);
+                if (streamSetObject.ranges().length != 0) {
+                    continue;
+                }
+                if (ctx.object2range.containsKey(streamSetObject.objectId())) {
+                    continue;
+                }
+                loadIndexCfList.add(
+                    ctx.rangeGetter
+                        .find(streamSetObject.objectId(), ctx.streamId)
+                        .thenAccept(range -> ctx.object2range.put(streamSetObject.objectId(), range))
+                );
             }
-            if (ctx.object2range.containsKey(streamSetObject.objectId())) {
-                continue;
+            if (loadIndexCfList.isEmpty()) {
+                return CompletableFuture.completedFuture(null);
             }
-            loadIndexCfList.add(
-                ctx.rangeGetter
-                    .find(streamSetObject.objectId(), ctx.streamId)
-                    .thenAccept(range -> ctx.object2range.put(streamSetObject.objectId(), range))
-            );
-        }
-        if (loadIndexCfList.isEmpty()) {
-            return CompletableFuture.completedFuture(null);
-        }
-        return CompletableFuture.allOf(loadIndexCfList.toArray(new CompletableFuture[0]))
-            .exceptionally(ex -> {
-                ctx.cf.completeExceptionally(ex);
-                return null;
-            });
+            return CompletableFuture.allOf(loadIndexCfList.toArray(new CompletableFuture[0]));
+        }, LOGGER, "loadStreamSetObjectInfo");
     }
 
     private Optional<StreamOffsetRange> findStreamInStreamSetObject(GetObjectsContext ctx, S3StreamSetObject object) {
