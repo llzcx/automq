@@ -12,6 +12,7 @@
 package com.automq.stream.s3.wal.impl.object;
 
 import com.automq.stream.s3.ByteBufAlloc;
+import com.automq.stream.s3.Constants;
 import com.automq.stream.s3.operator.ObjectStorage;
 import com.automq.stream.s3.wal.AppendResult;
 import com.automq.stream.s3.wal.common.RecordHeader;
@@ -42,6 +43,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Function;
 import org.apache.commons.codec.digest.DigestUtils;
+import org.apache.commons.lang3.exception.ExceptionUtils;
 import org.apache.commons.lang3.tuple.Pair;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -78,7 +80,7 @@ public class RecordAccumulator implements Closeable {
         this.time = time;
         this.objectStorage = objectStorage;
         this.config = config;
-        this.nodePrefix = DigestUtils.md5Hex(String.valueOf(config.nodeId())).toUpperCase(Locale.ROOT) + "/" + config.clusterId() + "/" + config.nodeId() + "/";
+        this.nodePrefix = DigestUtils.md5Hex(String.valueOf(config.nodeId())).toUpperCase(Locale.ROOT) + "/" + Constants.DEFAULT_NAMESPACE + config.clusterId() + "/" + config.nodeId() + "/";
         this.objectPrefix = nodePrefix + config.epoch() + "/wal/";
         this.executorService = Threads.newSingleThreadScheduledExecutor("s3-wal-schedule", true, log);
         this.monitorService = Threads.newSingleThreadScheduledExecutor("s3-wal-monitor", true, log);
@@ -231,7 +233,9 @@ public class RecordAccumulator implements Closeable {
         return flushedOffset.get();
     }
 
-    public List<WALObject> objectList() {
+    public List<WALObject> objectList() throws WALFencedException {
+        checkStatus();
+
         List<WALObject> list = new ArrayList<>(objectMap.size() + previousObjectMap.size());
         list.addAll(previousObjectMap.values());
         list.addAll(objectMap.values());
@@ -243,7 +247,7 @@ public class RecordAccumulator implements Closeable {
         return executorService;
     }
 
-    protected void checkStatus() {
+    protected void checkStatus() throws WALFencedException {
         if (closed) {
             throw new IllegalStateException("WAL is closed.");
         }
@@ -253,7 +257,7 @@ public class RecordAccumulator implements Closeable {
         }
     }
 
-    protected void checkWriteStatus() {
+    protected void checkWriteStatus() throws WALFencedException {
         if (config.failover()) {
             throw new IllegalStateException("WAL is in failover mode.");
         }
@@ -272,7 +276,7 @@ public class RecordAccumulator implements Closeable {
     }
 
     public long append(long recordSize, Function<Long, ByteBuf> recordSupplier,
-        CompletableFuture<AppendResult.CallbackResult> future) throws OverCapacityException {
+        CompletableFuture<AppendResult.CallbackResult> future) throws OverCapacityException, WALFencedException {
         long startTime = time.nanoseconds();
         checkWriteStatus();
 
@@ -325,7 +329,7 @@ public class RecordAccumulator implements Closeable {
         }
     }
 
-    public CompletableFuture<Void> reset() {
+    public CompletableFuture<Void> reset() throws WALFencedException {
         checkStatus();
 
         if (objectMap.isEmpty() && previousObjectMap.isEmpty()) {
@@ -360,7 +364,7 @@ public class RecordAccumulator implements Closeable {
     }
 
     // Trim objects where the last offset is less than or equal to the given offset.
-    public CompletableFuture<Void> trim(long offset) {
+    public CompletableFuture<Void> trim(long offset) throws WALFencedException {
         checkStatus();
 
         if (objectMap.isEmpty() || offset < objectMap.firstKey() || offset > flushedOffset.get()) {
@@ -397,7 +401,7 @@ public class RecordAccumulator implements Closeable {
 
     // Not thread safe, caller should hold lock.
     // Visible for testing.
-    public void unsafeUpload(boolean force) {
+    public void unsafeUpload(boolean force) throws WALFencedException {
         if (!force) {
             checkWriteStatus();
         }
@@ -520,9 +524,11 @@ public class RecordAccumulator implements Closeable {
             })
             .whenComplete((v, throwable) -> {
                 bufferedDataBytes.addAndGet(-dataLength);
+                throwable = ExceptionUtils.getRootCause(throwable);
                 if (throwable instanceof WALFencedException) {
                     List<Record> uploadedRecords = uploadMap.remove(firstOffset);
-                    uploadedRecords.forEach(record -> record.future.completeExceptionally(throwable));
+                    Throwable finalThrowable = throwable;
+                    uploadedRecords.forEach(record -> record.future.completeExceptionally(finalThrowable));
                 } else if (throwable != null) {
                     // Never fail the write task, the under layer storage will retry forever.
                     log.error("[Bug] Failed to write records to S3: {}", firstOffset, throwable);

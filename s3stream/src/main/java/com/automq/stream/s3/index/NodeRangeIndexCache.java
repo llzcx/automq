@@ -12,7 +12,7 @@
 package com.automq.stream.s3.index;
 
 import com.automq.stream.s3.cache.AsyncMeasurable;
-import com.automq.stream.s3.cache.AsyncObjectLRUCache;
+import com.automq.stream.s3.cache.AsyncLRUCache;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -21,7 +21,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 public class NodeRangeIndexCache {
-    private static final Integer MAX_CACHE_SIZE = 100 * 1024 * 1024;
+    private static final int MAX_CACHE_SIZE = 100 * 1024 * 1024;
+    public static final int ZGC_OBJECT_HEADER_SIZE_BYTES = 16;
     private static final Logger LOGGER = LoggerFactory.getLogger(NodeRangeIndexCache.class);
     private volatile static NodeRangeIndexCache instance = null;
     private final LRUCache nodeRangeIndexMap = new LRUCache(MAX_CACHE_SIZE);
@@ -72,6 +73,7 @@ public class NodeRangeIndexCache {
 
     static class StreamRangeIndexCache implements AsyncMeasurable {
         private final CompletableFuture<Map<Long, List<RangeIndex>>> streamRangeIndexMapCf;
+        private CompletableFuture<Integer> sizeCf;
 
         public StreamRangeIndexCache(CompletableFuture<Map<Long, List<RangeIndex>>> streamRangeIndexMapCf) {
             this.streamRangeIndexMapCf = streamRangeIndexMapCf;
@@ -82,9 +84,12 @@ public class NodeRangeIndexCache {
         }
 
         @Override
-        public CompletableFuture<Integer> size() {
-            return this.streamRangeIndexMapCf.thenApply(v -> v.values().stream()
-                .mapToInt(rangeIndices -> Long.BYTES + rangeIndices.size() * RangeIndex.SIZE).sum());
+        public synchronized CompletableFuture<Integer> size() {
+            if (sizeCf == null) {
+                sizeCf = this.streamRangeIndexMapCf.thenApply(v -> v.values().stream()
+                    .mapToInt(rangeIndices -> Long.BYTES + ZGC_OBJECT_HEADER_SIZE_BYTES + rangeIndices.size() * RangeIndex.SIZE).sum());
+            }
+            return sizeCf;
         }
 
         @Override
@@ -93,7 +98,7 @@ public class NodeRangeIndexCache {
         }
     }
 
-    static class LRUCache extends AsyncObjectLRUCache<Long, StreamRangeIndexCache> {
+    static class LRUCache extends AsyncLRUCache<Long, StreamRangeIndexCache> {
         public LRUCache(int maxSize) {
             super(maxSize);
         }
