@@ -170,7 +170,7 @@ public abstract class AbstractObjectStorage implements ObjectStorage {
                     .whenComplete((v, ex) ->
                         NetworkStats.getInstance()
                             .networkLimiterQueueTimeStats(AsyncNetworkBandwidthLimiter.Type.INBOUND, throttleStrategy)
-                            .record(TimerUtil.durationElapsedAs(startTime, TimeUnit.NANOSECONDS)));
+                            .record(TimerUtil.timeElapsedSince(startTime, TimeUnit.NANOSECONDS)));
 
             };
 
@@ -919,10 +919,12 @@ public abstract class AbstractObjectStorage implements ObjectStorage {
     public static class ObjectStorageCompletedPart {
         private final int partNumber;
         private final String partId;
+        private final String checkSum;
 
-        public ObjectStorageCompletedPart(int partNumber, String partId) {
+        public ObjectStorageCompletedPart(int partNumber, String partId, String checkSum) {
             this.partNumber = partNumber;
             this.partId = partId;
+            this.checkSum = checkSum;
         }
 
         public int getPartNumber() {
@@ -931,6 +933,10 @@ public abstract class AbstractObjectStorage implements ObjectStorage {
 
         public String getPartId() {
             return partId;
+        }
+
+        public String getCheckSum() {
+            return checkSum;
         }
     }
 }

@@ -30,7 +30,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.function.LongSupplier;
 import java.util.function.Supplier;
+
+import static com.automq.stream.s3.metrics.S3StreamMetricsConstant.LABEL_CACHE_NAME;
 
 public class S3StreamMetricsManager {
     private static final List<ConfigListener> BASE_ATTRIBUTES_LISTENERS = new ArrayList<>();
@@ -44,6 +47,8 @@ public class S3StreamMetricsManager {
     public static final List<HistogramMetric> WRITE_S3_METRICS = new CopyOnWriteArrayList<>();
     public static final List<HistogramMetric> GET_INDEX_METRICS = new CopyOnWriteArrayList<>();
     public static final List<HistogramMetric> READ_BLOCK_CACHE_TIME_METRICS = new CopyOnWriteArrayList<>();
+    public static final List<HistogramMetric> GET_OBJECTS_TIME_METRICS = new CopyOnWriteArrayList<>();
+    public static final List<HistogramMetric> OBJECTS_TO_SEARCH_COUNT_METRICS = new CopyOnWriteArrayList<>();
     private static LongCounter s3DownloadSizeInTotal = new NoopLongCounter();
     private static LongCounter s3UploadSizeInTotal = new NoopLongCounter();
     private static HistogramInstrument operationLatency;
@@ -51,6 +56,7 @@ public class S3StreamMetricsManager {
     private static HistogramInstrument objectStageCost;
     private static LongCounter networkInboundUsageInTotal = new NoopLongCounter();
     private static LongCounter networkOutboundUsageInTotal = new NoopLongCounter();
+    private static LongCounter nodeRangeIndexCacheOperationCountTotal = new NoopLongCounter();
     private static ObservableLongGauge networkInboundAvailableBandwidth = new NoopObservableLongGauge();
     private static ObservableLongGauge networkOutboundAvailableBandwidth = new NoopObservableLongGauge();
     private static ObservableLongGauge networkInboundLimiterQueueSize = new NoopObservableLongGauge();
@@ -63,6 +69,8 @@ public class S3StreamMetricsManager {
     private static HistogramInstrument writeS3LimiterTime;
     private static HistogramInstrument getIndexTime;
     private static HistogramInstrument readBlockCacheTime;
+    private static HistogramInstrument getObjectsTime;
+    private static HistogramInstrument objectsToSearchCount;
     private static ObservableLongGauge deltaWalStartOffset = new NoopObservableLongGauge();
     private static ObservableLongGauge pendUploadWalBytes = new NoopObservableLongGauge();
     private static ObservableLongGauge deltaWalTrimmedOffset = new NoopObservableLongGauge();
@@ -71,12 +79,30 @@ public class S3StreamMetricsManager {
     private static ObservableLongGauge availableInflightReadAheadSize = new NoopObservableLongGauge();
     private static ObservableLongGauge availableInflightS3ReadQuota = new NoopObservableLongGauge();
     private static ObservableLongGauge availableInflightS3WriteQuota = new NoopObservableLongGauge();
+
+    private static ObservableLongGauge asyncCacheItemNumber = new NoopObservableLongGauge();
+    private static ObservableLongGauge asyncCacheSizeNumber = new NoopObservableLongGauge();
+    private static ObservableLongGauge asyncCacheMaxSizeNumber = new NoopObservableLongGauge();
+
     private static ObservableLongGauge inflightWALUploadTasksCount = new NoopObservableLongGauge();
     private static ObservableLongGauge allocatedMemorySize = new NoopObservableLongGauge();
     private static ObservableLongGauge usedMemorySize = new NoopObservableLongGauge();
     private static ObservableLongGauge pendingStreamAppendLatencyMetrics = new NoopObservableLongGauge();
     private static ObservableLongGauge pendingStreamFetchLatencyMetrics = new NoopObservableLongGauge();
     private static ObservableLongGauge compactionDelayTimeMetrics = new NoopObservableLongGauge();
+    private static ObservableLongGauge localStreamRangeIndexCacheSizeMetrics = new NoopObservableLongGauge();
+    private static ObservableLongGauge localStreamRangeIndexCacheStreamNumMetrics = new NoopObservableLongGauge();
+
+    private static LongCounter asyncCacheEvictCount;
+    private static LongCounter asyncCacheHitCount;
+    private static LongCounter asyncCacheMissCount;
+    private static LongCounter asyncCachePutCount;
+    private static LongCounter asyncCachePopCount;
+    private static LongCounter asyncCacheOverWriteCount;
+    private static LongCounter asyncCacheRemoveNotCompletedCount;
+    private static LongCounter asyncCacheRemoveCompletedCount;
+    private static LongCounter asyncCacheItemCompleteExceptionallyCount;
+
     private static LongCounter compactionReadSizeInTotal = new NoopLongCounter();
     private static LongCounter compactionWriteSizeInTotal = new NoopLongCounter();
     private static Supplier<Long> networkInboundAvailableBandwidthSupplier = () -> 0L;
@@ -90,10 +116,17 @@ public class S3StreamMetricsManager {
     private static Supplier<Long> deltaWALCacheSizeSupplier = () -> 0L;
     private static Supplier<Long> blockCacheSizeSupplier = () -> 0L;
     private static Supplier<Long> compactionDelayTimeSupplier = () -> 0L;
+    private static Supplier<Integer> localStreamRangeIndexCacheSize = () -> 0;
+    private static Supplier<Integer> localStreamRangeIndexCacheStreamNum = () -> 0;
     private static LongCounter blockCacheOpsThroughput = new NoopLongCounter();
 
     private static Map<Integer, Supplier<Integer>> availableInflightS3ReadQuotaSupplier = new ConcurrentHashMap<>();
     private static Map<Integer, Supplier<Integer>> availableInflightS3WriteQuotaSupplier = new ConcurrentHashMap<>();
+
+    private static Map<String, LongSupplier> asyncCacheItemNumberSupplier = new ConcurrentHashMap<>();
+    private static Map<String, LongSupplier> asyncCacheSizeSupplier = new ConcurrentHashMap<>();
+    private static Map<String, LongSupplier> asyncCacheMaxSizeSupplier = new ConcurrentHashMap<>();
+
     private static Supplier<Integer> inflightWALUploadTasksCountSupplier = () -> 0;
     private static Map<Long, Supplier<Long>> pendingStreamAppendLatencySupplier = new ConcurrentHashMap<>();
     private static Map<Long, Supplier<Long>> pendingStreamFetchLatencySupplier = new ConcurrentHashMap<>();
@@ -146,6 +179,9 @@ public class S3StreamMetricsManager {
             .setDescription("Network outbound usage")
             .setUnit("bytes")
             .build();
+        nodeRangeIndexCacheOperationCountTotal = meter.counterBuilder(prefix + S3StreamMetricsConstant.NODE_RANGE_INDEX_CACHE_OPERATION_COUNT_METRIC_NAME)
+            .setDescription("Range index cache operation count")
+            .build();
         networkInboundAvailableBandwidth = meter.gaugeBuilder(prefix + S3StreamMetricsConstant.NETWORK_INBOUND_AVAILABLE_BANDWIDTH_METRIC_NAME)
             .setDescription("Network inbound available bandwidth")
             .setUnit("bytes")
@@ -196,6 +232,10 @@ public class S3StreamMetricsManager {
                 "Get index time", "nanoseconds", () -> GET_INDEX_METRICS);
         readBlockCacheTime = new HistogramInstrument(meter, prefix + S3StreamMetricsConstant.READ_BLOCK_CACHE_METRIC_NAME,
                 "Read block cache time", "nanoseconds", () -> READ_BLOCK_CACHE_TIME_METRICS);
+        getObjectsTime = new HistogramInstrument(meter, prefix + S3StreamMetricsConstant.GET_OBJECTS_TIME_METRIC_NAME,
+                "Get objects time", "nanoseconds", () -> GET_OBJECTS_TIME_METRICS);
+        objectsToSearchCount = new HistogramInstrument(meter, prefix + S3StreamMetricsConstant.OBJECTS_SEARCH_COUNT_METRIC_NAME,
+                "Number of SSO object to search when get objects", "count", () -> OBJECTS_TO_SEARCH_COUNT_METRICS);
         deltaWalStartOffset = meter.gaugeBuilder(prefix + S3StreamMetricsConstant.WAL_START_OFFSET)
             .setDescription("Delta WAL start offset")
             .ofLongs()
@@ -283,6 +323,7 @@ public class S3StreamMetricsManager {
             .setDescription("Compaction write size")
             .setUnit("bytes")
             .build();
+
         allocatedMemorySize = meter.gaugeBuilder(prefix + S3StreamMetricsConstant.BUFFER_ALLOCATED_MEMORY_SIZE_METRIC_NAME)
             .setDescription("Buffer allocated memory size")
             .setUnit("bytes")
@@ -337,6 +378,98 @@ public class S3StreamMetricsManager {
                     result.record(compactionDelayTimeSupplier.get(), metricsConfig.getBaseAttributes());
                 }
             });
+        localStreamRangeIndexCacheSizeMetrics = meter.gaugeBuilder(prefix + S3StreamMetricsConstant.LOCAL_STREAM_RANGE_INDEX_CACHE_SIZE_METRIC_NAME)
+            .setDescription("Local stream range index cache size")
+            .setUnit("bytes")
+            .ofLongs()
+            .buildWithCallback(result -> {
+                if (MetricsLevel.INFO.isWithin(metricsConfig.getMetricsLevel())) {
+                    result.record(localStreamRangeIndexCacheSize.get(), metricsConfig.getBaseAttributes());
+                }
+            });
+        localStreamRangeIndexCacheStreamNumMetrics = meter.gaugeBuilder(prefix + S3StreamMetricsConstant.LOCAL_STREAM_RANGE_INDEX_CACHE_STREAM_NUM_METRIC_NAME)
+            .setDescription("Local stream range index cache stream number")
+            .ofLongs()
+            .buildWithCallback(result -> {
+                if (MetricsLevel.INFO.isWithin(metricsConfig.getMetricsLevel())) {
+                    result.record(localStreamRangeIndexCacheStreamNum.get(), metricsConfig.getBaseAttributes());
+                }
+            });
+
+        initAsyncCacheMetrics(meter, prefix);
+    }
+
+    private static void initAsyncCacheMetrics(Meter meter, String prefix) {
+        asyncCacheEvictCount = meter.counterBuilder(prefix + S3StreamMetricsConstant.ASYNC_CACHE_EVICT_COUNT_METRIC_NAME)
+            .setDescription("AsyncLRU cache evict count")
+            .setUnit("count")
+            .build();
+
+        asyncCacheHitCount = meter.counterBuilder(prefix + S3StreamMetricsConstant.ASYNC_CACHE_HIT_COUNT_METRIC_NAME)
+            .setDescription("AsyncLRU cache hit count")
+            .setUnit("count")
+            .build();
+
+        asyncCacheMissCount = meter.counterBuilder(prefix + S3StreamMetricsConstant.ASYNC_CACHE_MISS_COUNT_METRIC_NAME)
+            .setDescription("AsyncLRU cache miss count")
+            .setUnit("count")
+            .build();
+
+        asyncCachePutCount = meter.counterBuilder(prefix + S3StreamMetricsConstant.ASYNC_CACHE_PUT_COUNT_METRIC_NAME)
+            .setDescription("AsyncLRU cache put item count")
+            .setUnit("count")
+            .build();
+        asyncCachePopCount = meter.counterBuilder(prefix + S3StreamMetricsConstant.ASYNC_CACHE_POP_COUNT_METRIC_NAME)
+            .setDescription("AsyncLRU cache pop item count")
+            .setUnit("count")
+            .build();
+        asyncCacheOverWriteCount = meter.counterBuilder(prefix + S3StreamMetricsConstant.ASYNC_CACHE_OVERWRITE_COUNT_METRIC_NAME)
+            .setDescription("AsyncLRU cache overwrite item count")
+            .setUnit("count")
+            .build();
+        asyncCacheRemoveNotCompletedCount = meter.counterBuilder(prefix + S3StreamMetricsConstant.ASYNC_CACHE_REMOVE_NOT_COMPLETE_COUNT_METRIC_NAME)
+            .setDescription("AsyncLRU cache remove not completed item count")
+            .setUnit("count")
+            .build();
+        asyncCacheRemoveCompletedCount = meter.counterBuilder(prefix + S3StreamMetricsConstant.ASYNC_CACHE_REMOVE_COMPLETE_COUNT_METRIC_NAME)
+            .setDescription("AsyncLRU cache remove completed item count")
+            .setUnit("count")
+            .build();
+        asyncCacheItemCompleteExceptionallyCount = meter.counterBuilder(prefix + S3StreamMetricsConstant.ASYNC_CACHE_ITEM_COMPLETE_EXCEPTIONALLY_COUNT_METRIC_NAME)
+            .setDescription("AsyncLRU cache item complete exceptionally count")
+            .setUnit("count")
+            .build();
+
+        asyncCacheItemNumber = meter.gaugeBuilder(prefix + S3StreamMetricsConstant.ASYNC_CACHE_ITEM_NUMBER_METRIC_NAME)
+            .setDescription("AsyncLRU cache item number")
+            .ofLongs()
+            .buildWithCallback(result -> {
+                if (MetricsLevel.DEBUG.isWithin(metricsConfig.getMetricsLevel())) {
+                    for (Map.Entry<String, LongSupplier> entry : asyncCacheItemNumberSupplier.entrySet()) {
+                        result.record(entry.getValue().getAsLong(), Attributes.of(LABEL_CACHE_NAME, entry.getKey()));
+                    }
+                }
+            });
+        asyncCacheSizeNumber = meter.gaugeBuilder(prefix + S3StreamMetricsConstant.ASYNC_CACHE_ITEM_SIZE_NAME)
+            .setDescription("AsyncLRU cache size")
+            .ofLongs()
+            .buildWithCallback(result -> {
+                if (MetricsLevel.DEBUG.isWithin(metricsConfig.getMetricsLevel())) {
+                    for (Map.Entry<String, LongSupplier> entry : asyncCacheSizeSupplier.entrySet()) {
+                        result.record(entry.getValue().getAsLong(), Attributes.of(LABEL_CACHE_NAME, entry.getKey()));
+                    }
+                }
+            });
+        asyncCacheMaxSizeNumber = meter.gaugeBuilder(prefix + S3StreamMetricsConstant.ASYNC_CACHE_ITEM_MAX_SIZE_NAME)
+            .setDescription("AsyncLRU cache max size")
+            .ofLongs()
+            .buildWithCallback(result -> {
+                if (MetricsLevel.DEBUG.isWithin(metricsConfig.getMetricsLevel())) {
+                    for (Map.Entry<String, LongSupplier> entry : asyncCacheMaxSizeSupplier.entrySet()) {
+                        result.record(entry.getValue().getAsLong(), Attributes.of(LABEL_CACHE_NAME, entry.getKey()));
+                    }
+                }
+            });
     }
 
     public static void registerNetworkLimiterSupplier(AsyncNetworkBandwidthLimiter.Type type,
@@ -378,6 +511,18 @@ public class S3StreamMetricsManager {
 
     public static void registerInflightS3WriteQuotaSupplier(Supplier<Integer> inflightS3WriteQuotaSupplier, int index) {
         S3StreamMetricsManager.availableInflightS3WriteQuotaSupplier.putIfAbsent(index, inflightS3WriteQuotaSupplier);
+    }
+
+    public static void registerAsyncCacheSizeSupplier(LongSupplier supplier, String cacheName) {
+        S3StreamMetricsManager.asyncCacheSizeSupplier.put(cacheName, supplier);
+    }
+
+    public static void registerAsyncCacheItemNumberSupplier(LongSupplier supplier, String cacheName) {
+        S3StreamMetricsManager.asyncCacheItemNumberSupplier.put(cacheName, supplier);
+    }
+
+    public static void registerAsyncCacheMaxSizeSupplier(LongSupplier supplier, String cacheName) {
+        S3StreamMetricsManager.asyncCacheMaxSizeSupplier.put(cacheName, supplier);
     }
 
     public static void registerInflightReadSizeLimiterSupplier(
@@ -583,6 +728,96 @@ public class S3StreamMetricsManager {
         }
     }
 
+    public static CounterMetric buildAsyncCacheEvictMetric(String cacheName) {
+        synchronized (BASE_ATTRIBUTES_LISTENERS) {
+            CounterMetric metric = new CounterMetric(metricsConfig,
+                Attributes.of(LABEL_CACHE_NAME, cacheName),
+                () -> asyncCacheEvictCount);
+            BASE_ATTRIBUTES_LISTENERS.add(metric);
+            return metric;
+        }
+    }
+
+    public static CounterMetric buildAsyncCacheHitMetric(String cacheName) {
+        synchronized (BASE_ATTRIBUTES_LISTENERS) {
+            CounterMetric metric = new CounterMetric(metricsConfig,
+                Attributes.of(LABEL_CACHE_NAME, cacheName),
+                () -> asyncCacheHitCount);
+            BASE_ATTRIBUTES_LISTENERS.add(metric);
+            return metric;
+        }
+    }
+
+    public static CounterMetric buildAsyncCacheMissMetric(String cacheName) {
+        synchronized (BASE_ATTRIBUTES_LISTENERS) {
+            CounterMetric metric = new CounterMetric(metricsConfig,
+                Attributes.of(LABEL_CACHE_NAME, cacheName),
+                () -> asyncCacheMissCount);
+            BASE_ATTRIBUTES_LISTENERS.add(metric);
+            return metric;
+        }
+    }
+
+    public static CounterMetric buildAsyncCachePutMetric(String cacheName) {
+        synchronized (BASE_ATTRIBUTES_LISTENERS) {
+            CounterMetric metric = new CounterMetric(metricsConfig,
+                Attributes.of(LABEL_CACHE_NAME, cacheName),
+                () -> asyncCachePutCount);
+            BASE_ATTRIBUTES_LISTENERS.add(metric);
+            return metric;
+        }
+    }
+
+    public static CounterMetric buildAsyncCachePopMetric(String cacheName) {
+        synchronized (BASE_ATTRIBUTES_LISTENERS) {
+            CounterMetric metric = new CounterMetric(metricsConfig,
+                Attributes.of(LABEL_CACHE_NAME, cacheName),
+                () -> asyncCachePopCount);
+            BASE_ATTRIBUTES_LISTENERS.add(metric);
+            return metric;
+        }
+    }
+
+    public static CounterMetric buildAsyncCacheOverwriteMetric(String cacheName) {
+        synchronized (BASE_ATTRIBUTES_LISTENERS) {
+            CounterMetric metric = new CounterMetric(metricsConfig,
+                Attributes.of(LABEL_CACHE_NAME, cacheName),
+                () -> asyncCacheOverWriteCount);
+            BASE_ATTRIBUTES_LISTENERS.add(metric);
+            return metric;
+        }
+    }
+
+    public static CounterMetric buildAsyncCacheRemoveNotCompleteMetric(String cacheName) {
+        synchronized (BASE_ATTRIBUTES_LISTENERS) {
+            CounterMetric metric = new CounterMetric(metricsConfig,
+                Attributes.of(LABEL_CACHE_NAME, cacheName),
+                () -> asyncCacheRemoveNotCompletedCount);
+            BASE_ATTRIBUTES_LISTENERS.add(metric);
+            return metric;
+        }
+    }
+
+    public static CounterMetric buildAsyncCacheRemoveCompleteMetric(String cacheName) {
+        synchronized (BASE_ATTRIBUTES_LISTENERS) {
+            CounterMetric metric = new CounterMetric(metricsConfig,
+                Attributes.of(LABEL_CACHE_NAME, cacheName),
+                () -> asyncCacheRemoveCompletedCount);
+            BASE_ATTRIBUTES_LISTENERS.add(metric);
+            return metric;
+        }
+    }
+
+    public static CounterMetric buildAsyncCacheItemCompleteExceptionallyMetric(String cacheName) {
+        synchronized (BASE_ATTRIBUTES_LISTENERS) {
+            CounterMetric metric = new CounterMetric(metricsConfig,
+                Attributes.of(LABEL_CACHE_NAME, cacheName),
+                () -> asyncCacheItemCompleteExceptionallyCount);
+            BASE_ATTRIBUTES_LISTENERS.add(metric);
+            return metric;
+        }
+    }
+
     public static CounterMetric buildCompactionReadSizeMetric() {
         synchronized (BASE_ATTRIBUTES_LISTENERS) {
             CounterMetric metric = new CounterMetric(metricsConfig, () -> compactionReadSizeInTotal);
@@ -595,6 +830,33 @@ public class S3StreamMetricsManager {
         synchronized (BASE_ATTRIBUTES_LISTENERS) {
             CounterMetric metric = new CounterMetric(metricsConfig, () -> compactionWriteSizeInTotal);
             BASE_ATTRIBUTES_LISTENERS.add(metric);
+            return metric;
+        }
+    }
+
+    public static HistogramMetric buildGetObjectsTimeMetric(MetricsLevel metricsLevel, String status) {
+        synchronized (BASE_ATTRIBUTES_LISTENERS) {
+            HistogramMetric metric = new HistogramMetric(metricsLevel, metricsConfig, AttributesUtils.buildAttributes(status));
+            BASE_ATTRIBUTES_LISTENERS.add(metric);
+            GET_OBJECTS_TIME_METRICS.add(metric);
+            return metric;
+        }
+    }
+
+    public static CounterMetric buildRangeIndexCacheOperationMetric(String type) {
+        synchronized (BASE_ATTRIBUTES_LISTENERS) {
+            CounterMetric metric = new CounterMetric(metricsConfig, Attributes.builder()
+                .put(S3StreamMetricsConstant.LABEL_TYPE, type).build(), () -> nodeRangeIndexCacheOperationCountTotal);
+            BASE_ATTRIBUTES_LISTENERS.add(metric);
+            return metric;
+        }
+    }
+
+    public static HistogramMetric buildObjectsToSearchMetric(MetricsLevel metricsLevel) {
+        synchronized (BASE_ATTRIBUTES_LISTENERS) {
+            HistogramMetric metric = new HistogramMetric(metricsLevel, metricsConfig);
+            BASE_ATTRIBUTES_LISTENERS.add(metric);
+            OBJECTS_TO_SEARCH_COUNT_METRICS.add(metric);
             return metric;
         }
     }
@@ -625,5 +887,13 @@ public class S3StreamMetricsManager {
 
     public static void registerCompactionDelayTimeSuppler(Supplier<Long> compactionDelayTimeSupplier) {
         S3StreamMetricsManager.compactionDelayTimeSupplier = compactionDelayTimeSupplier;
+    }
+
+    public static void registerLocalStreamRangeIndexCacheSizeSupplier(Supplier<Integer> localStreamRangeIndexCacheSize) {
+        S3StreamMetricsManager.localStreamRangeIndexCacheSize = localStreamRangeIndexCacheSize;
+    }
+
+    public static void registerLocalStreamRangeIndexCacheStreamNumSupplier(Supplier<Integer> localStreamRangeIndexCacheStreamNum) {
+        S3StreamMetricsManager.localStreamRangeIndexCacheStreamNum = localStreamRangeIndexCacheStreamNum;
     }
 }

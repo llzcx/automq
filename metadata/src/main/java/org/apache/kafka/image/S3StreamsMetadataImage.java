@@ -17,12 +17,17 @@
 
 package org.apache.kafka.image;
 
+import com.automq.stream.s3.exceptions.ObjectNotExistException;
 import com.automq.stream.s3.index.LocalStreamRangeIndexCache;
 import com.automq.stream.s3.index.NodeRangeIndexCache;
 import com.automq.stream.s3.metadata.ObjectUtils;
 import com.automq.stream.s3.metadata.S3ObjectMetadata;
 import com.automq.stream.s3.metadata.S3ObjectType;
 import com.automq.stream.s3.metadata.StreamOffsetRange;
+import com.automq.stream.s3.metrics.MetricsLevel;
+import com.automq.stream.s3.metrics.TimerUtil;
+import com.automq.stream.s3.metrics.stats.MetadataStats;
+import com.automq.stream.utils.FutureUtil;
 import io.netty.buffer.ByteBuf;
 import io.netty.util.AbstractReferenceCounted;
 import io.netty.util.ReferenceCounted;
@@ -38,6 +43,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.metadata.AssignedStreamIdRecord;
@@ -152,12 +158,21 @@ public final class S3StreamsMetadataImage extends AbstractReferenceCounted {
      */
     public CompletableFuture<InRangeObjects> getObjects(long streamId, long startOffset, long endOffset, int limit,
         RangeGetter rangeGetter, LocalStreamRangeIndexCache indexCache) {
+        long startTimeNanos = System.nanoTime();
         GetObjectsContext ctx = new GetObjectsContext(streamId, startOffset, endOffset, limit, rangeGetter, indexCache);
         try {
             getObjects0(ctx);
         } catch (Throwable e) {
             ctx.cf.completeExceptionally(e);
         }
+        ctx.cf.whenComplete((r, ex) -> {
+            long timeElapsedNanos = TimerUtil.timeElapsedSince(startTimeNanos, TimeUnit.NANOSECONDS);
+            if (ex != null) {
+                MetadataStats.getInstance().getObjectsTimeFailedStats().record(timeElapsedNanos);
+            } else {
+                MetadataStats.getInstance().getObjectsTimeSuccessStats().record(timeElapsedNanos);
+            }
+        });
         return ctx.cf;
     }
 
@@ -217,6 +232,8 @@ public final class S3StreamsMetadataImage extends AbstractReferenceCounted {
     ) {
         ctx.record(objects.size(), lastRangeIndex, streamObjectIndex, streamSetObjectIndex);
         long nextStartOffset = ctx.nextStartOffset;
+        boolean firstTimeSearchInSSO = true;
+        int finalStartSearchIndex = streamSetObjectIndex;
         for (; ; ) {
             int roundStartObjectSize = objects.size();
 
@@ -260,6 +277,7 @@ public final class S3StreamsMetadataImage extends AbstractReferenceCounted {
                     streamSetObjects = Collections.emptyList();
                 }
 
+                ctx.isFromSparseIndex = false;
                 CompletableFuture<Integer> startSearchIndexCf = getStartSearchIndex(node, nextStartOffset, ctx);
                 final int finalLastRangeIndex = lastRangeIndex;
                 final long finalNextStartOffset = nextStartOffset;
@@ -268,7 +286,9 @@ public final class S3StreamsMetadataImage extends AbstractReferenceCounted {
                 final NodeS3StreamSetObjectMetadataImage finalNode = node;
                 startSearchIndexCf.whenComplete((index, ex) -> {
                     if (ex != null) {
-                        LOGGER.error("Failed to get start search index", ex);
+                        if (!(FutureUtil.cause(ex) instanceof ObjectNotExistException)) {
+                            LOGGER.error("Failed to get start search index", ex);
+                        }
                         index = 0;
                     }
                     // load stream set object index
@@ -301,6 +321,10 @@ public final class S3StreamsMetadataImage extends AbstractReferenceCounted {
                     objects.add(new S3ObjectMetadata(streamSetObject.objectId(), S3ObjectType.STREAM_SET, List.of(streamOffsetRange),
                         streamSetObject.dataTimeInMs()));
                     nextStartOffset = streamOffsetRange.endOffset();
+                    if (firstTimeSearchInSSO && ctx.isFromSparseIndex) {
+                        MetadataStats.getInstance().getRangeIndexSkippedObjectNumStats().record(streamSetObjectIndex - finalStartSearchIndex);
+                        firstTimeSearchInSSO = false;
+                    }
                     if (objects.size() >= ctx.limit || (ctx.endOffset != ObjectUtils.NOOP_OFFSET && nextStartOffset >= ctx.endOffset)) {
                         completeWithSanityCheck(ctx, objects);
                         return;
@@ -392,12 +416,19 @@ public final class S3StreamsMetadataImage extends AbstractReferenceCounted {
             return CompletableFuture.completedFuture(index);
         }
         // search in sparse index
+        ctx.isFromSparseIndex = true;
         return getStartStreamSetObjectId(node.getNodeId(), startOffset, ctx)
             .thenApply(objectId -> {
-                int startIndex = findStartSearchIndex(objectId, node.orderList());
+                int startIndex = -1;
+                if (objectId >= 0) {
+                    startIndex = findStartSearchIndex(objectId, node.orderList());
+                    MetadataStats.getInstance().getRangeIndexHitCountStats().add(MetricsLevel.INFO, 1);
+                } else {
+                    MetadataStats.getInstance().getRangeIndexMissCountStats().add(MetricsLevel.INFO, 1);
+                }
                 if (startIndex < 0 && ctx.indexCache.nodeId() != node.getNodeId()) {
-                    LOGGER.info("Stream set object {} not found in node {}, invalidate index cache", objectId, node.getNodeId());
                     NodeRangeIndexCache.getInstance().invalidate(node.getNodeId());
+                    MetadataStats.getInstance().getRangeIndexInvalidateCountStats().add(MetricsLevel.INFO, 1);
                 }
                 return Math.max(0, startIndex);
             });
@@ -407,7 +438,7 @@ public final class S3StreamsMetadataImage extends AbstractReferenceCounted {
      * Get the object id of the first stream set object to start search from.
      * Possible results:
      * <p>
-     * a. -1, not stream set object can be found, this can happen when index cache is not exist or is invalidated,
+     * a. -1, no stream set object can be found, this can happen when index cache is not exist or is invalidated,
      * searching should be done from the beginning of the objects in this case.
      * <p>
      * b. non-negative value:
@@ -641,6 +672,7 @@ public final class S3StreamsMetadataImage extends AbstractReferenceCounted {
         long nextStartOffset;
         long endOffset;
         int limit;
+        boolean isFromSparseIndex;
         RangeGetter rangeGetter;
         LocalStreamRangeIndexCache indexCache;
 
@@ -657,6 +689,7 @@ public final class S3StreamsMetadataImage extends AbstractReferenceCounted {
             this.limit = limit;
             this.rangeGetter = rangeGetter;
             this.indexCache = indexCache;
+            this.isFromSparseIndex = false;
         }
 
         public void record(int objectSize, int lastRangeIndex, int streamObjectIndex, int streamSetObjectIndex) {
